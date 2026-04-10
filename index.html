@@ -1139,10 +1139,11 @@ input[type=file]{padding:8px 12px;color:var(--t2);font-size:12px;}
       if (!name || name.toLowerCase().includes('full product name')) continue;
       const short = (r[col('short_name')] || name).toString().trim();
       const sp = parseFloat(r[col('sticker_price')]);
-      const type = (r[col('item_type')] || 'Sealed').toString().trim();
-      // Skip non-data rows (e.g. legend row 6)
+      const rawType = (r[col('item_type')] || '').toString().trim();
+      // Skip non-data rows (e.g. legend row 6) — require a recognised item_type
       const _vt = ['sealed','singles','graded','other','pokemon','magic','one piece','yu-gi-oh'];
-      if (!_vt.includes(type.toLowerCase())) continue;
+      if (!rawType || !_vt.includes(rawType.toLowerCase())) continue;
+      const type = rawType;
       const urlRaw = (r[col('tcgplayer_url')] || '').toString().trim();
       const match = urlRaw.match(/\/product\/(\d+)/);
       const idBase = match ? match[1] : name.replace(/[^a-z0-9]/gi,'').slice(0,8).toLowerCase()+i;
@@ -1578,9 +1579,9 @@ function openLogModal() {
 // ══════════════════════════════════════════
 // POS
 // ══════════════════════════════════════════
-function setFilter(f) {
-  posFilter = f;
-  document.querySelectorAll('.tog').forEach(t => t.classList.toggle('active', t.dataset.filter === f));
+function setFilter() {
+  posFilter     = document.getElementById('filterType')?.value || 'all';
+  posGameFilter = document.getElementById('filterGame')?.value || 'all';
   renderPOS();
 }
 
@@ -3173,10 +3174,11 @@ function importXLSX(event) {
         const r = rows[i];
         const name = String(r[col('product_name')] || '').trim();
         if (!name || name === 'Full product name as it appears on TCGPlayer') continue;
-        const itemType = String(r[col('item_type')] || 'Sealed').trim();
-        // Skip non-data rows (e.g. legend row 6) — require a recognised item_type
+        // Check raw item_type BEFORE applying default — row 6 has empty item_type but a non-empty product_name
+        const rawItemType = String(r[col('item_type')] || '').trim();
         const _validTypes = ['sealed','singles','graded','other','pokemon','magic','one piece','yu-gi-oh'];
-        if (!_validTypes.includes(itemType.toLowerCase())) continue;
+        if (!rawItemType || !_validTypes.includes(rawItemType.toLowerCase())) continue;
+        const itemType = rawItemType;
         const urlRaw = String(r[col('tcgplayer_url')] || '').trim();
         const match = urlRaw.match(/\/product\/(\d+)/);
         const idBase = match ? match[1] : name.replace(/\W/g,'').slice(0,8).toLowerCase() + i;
