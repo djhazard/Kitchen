@@ -1459,40 +1459,47 @@ function csvDateStamp() {
 // BATCH MARKET PRICE FETCH (for Inv $ stat)
 // ══════════════════════════════════════════
 async function batchFetchMarketPrices() {
-  // statInvVal removed — batch fetch still caches prices for future use
+  const sealedSingles = inventory.filter(i => i.type !== 'Graded' && i.type !== 'Other' && i.url);
 
-  const sealedSingles = inventory.filter(i => i.type !== 'Graded' && i.url);
-  // Collect unique groupIds needed
-  const groupIds = new Set();
-  const itemGroupMap = {}; // itemId → groupId
+  // Build map of cacheKey → { gamePrefix, gid, items[] }
+  const groupFetchMap = {}; // cacheKey → { gamePrefix, gid, items: [{id, pid}] }
 
   for (const item of sealedSingles) {
     const match = item.url.match(/\/product\/(\d+)/);
     if (!match) continue;
+    const gameName = (item.game || '').trim() || 'Pokemon';
+    const gamePrefix = TCGCSV_GAME_PREFIX[gameName] || 3;
     const gid = getGroupId(item.set);
-    if (gid) { groupIds.add(gid); itemGroupMap[item.id] = { gid, pid: parseInt(match[1]) }; }
+    if (!gid) continue;
+    const cacheKey = `${gamePrefix}_${gid}`;
+    if (!groupFetchMap[cacheKey]) groupFetchMap[cacheKey] = { gamePrefix, gid, items: [] };
+    groupFetchMap[cacheKey].items.push({ id: item.id, pid: String(parseInt(match[1])) });
   }
 
-  // Fetch each unique group's prices (already cached if previously fetched)
-  for (const gid of groupIds) {
-    if (!priceCache[gid]) {
+  // Fetch price data for each unique group (use cacheKey consistently)
+  for (const [cacheKey, entry] of Object.entries(groupFetchMap)) {
+    if (!priceCache[cacheKey]) {
       try {
-        const res = await fetch(`https://tcgcsv.com/tcgplayer/3/${gid}/prices`);
-        if (res.ok) { const data = await res.json(); priceCache[gid] = data.results || []; }
+        const res = await fetch(`https://tcgcsv.com/tcgplayer/${entry.gamePrefix}/${entry.gid}/prices`);
+        if (res.ok) {
+          const data = await res.json();
+          priceCache[cacheKey] = data.results || [];
+        }
       } catch(e) {}
     }
   }
 
-  // Map prices to items
-  for (const item of sealedSingles) {
-    const entry = itemGroupMap[item.id];
-    if (!entry) continue;
-    const rows = (priceCache[entry.gid] || []).filter(r => r.productId === entry.pid);
-    const best = rows.find(r => r.marketPrice && r.subTypeName === 'Normal')
-               || rows.find(r => r.marketPrice && !r.subTypeName)
-               || rows.find(r => r.marketPrice);
-    if (best?.marketPrice) {
-      marketPriceStore[item.id] = parseFloat(best.marketPrice);
+  // Map prices back to items — compare productId as string to handle API type variations
+  for (const [cacheKey, entry] of Object.entries(groupFetchMap)) {
+    const priceRows = priceCache[cacheKey] || [];
+    for (const { id, pid } of entry.items) {
+      const rows = priceRows.filter(r => String(r.productId) === pid);
+      const best = rows.find(r => r.marketPrice && r.subTypeName === 'Normal')
+                 || rows.find(r => r.marketPrice && !r.subTypeName)
+                 || rows.find(r => r.marketPrice);
+      if (best?.marketPrice) {
+        marketPriceStore[id] = parseFloat(best.marketPrice);
+      }
     }
   }
 
@@ -1504,7 +1511,6 @@ async function batchFetchMarketPrices() {
   }
 
   localStorage.setItem('ktcg_mktprices', JSON.stringify(marketPriceStore));
-
 }
 
 function updateInvValStat() {
@@ -1854,7 +1860,8 @@ async function fetchMarketPrice(item) {
       priceCache[cacheKey] = data.results || [];
     }
 
-    const rows = priceCache[cacheKey].filter(r => r.productId === productId);
+    // Compare as string — tcgcsv API may return productId as string or number
+    const rows = priceCache[cacheKey].filter(r => String(r.productId) === String(productId));
     const best = rows.find(r => r.marketPrice && r.subTypeName === 'Normal')
               || rows.find(r => r.marketPrice && !r.subTypeName)
               || rows.find(r => r.marketPrice)
@@ -1871,6 +1878,7 @@ async function fetchMarketPrice(item) {
       marketEl.innerHTML = `<span style="color:var(--t3)">No price data</span>`;
     }
   } catch(e) {
+    console.warn('fetchMarketPrice error:', e.message, 'item:', item.name, 'set:', item.set);
     marketEl.innerHTML = `<span style="color:var(--t3)">Unavailable</span>`;
   }
 }
