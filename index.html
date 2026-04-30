@@ -1167,6 +1167,26 @@ input[type=file]{padding:8px 12px;color:var(--t2);font-size:12px;}
       if (!isNaN(sp) && sp > 0) priceMap[id] = sp.toString();
     }
     if (!rows.length) throw new Error('No data rows found');
+    // Market price proxy — fetches tcgcsv.com server-side (no CORS issues)
+    if (action === 'getMarketPrice') {
+      const gamePrefix = e.parameter.gamePrefix || '3';
+      const groupId    = e.parameter.groupId;
+      if (!groupId) throw new Error('Missing groupId parameter');
+      const url = `https://tcgcsv.com/tcgplayer/${gamePrefix}/${groupId}/prices`;
+      const resp = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+      if (resp.getResponseCode() !== 200) throw new Error('tcgcsv fetch failed: ' + resp.getResponseCode());
+      return ContentService.createTextOutput(resp.getContentText()).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // Groups proxy — fetch group list for a game (used when set name not in local map)
+    if (action === 'getGroups') {
+      const gamePrefix = e.parameter.gamePrefix || '3';
+      const url = `https://tcgcsv.com/tcgplayer/${gamePrefix}/groups`;
+      const resp = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+      if (resp.getResponseCode() !== 200) throw new Error('tcgcsv groups fetch failed: ' + resp.getResponseCode());
+      return ContentService.createTextOutput(resp.getContentText()).setMimeType(ContentService.MimeType.JSON);
+    }
+
     const result = action==='getPrices'
       ? {prices:Object.fromEntries(rows.map(r=>[r.short,priceMap[r.id]]).filter(p=>p[1]))}
       : {inventory:rows,prices:priceMap,count:rows.length};
@@ -1459,16 +1479,18 @@ function csvDateStamp() {
 // BATCH MARKET PRICE FETCH (for Inv $ stat)
 // ══════════════════════════════════════════
 async function batchFetchMarketPrices() {
+  const scriptUrl = getSheetsUrl();
+  if (!scriptUrl) return; // no proxy available — skip silently
+
   const sealedSingles = inventory.filter(i => i.type !== 'Graded' && i.type !== 'Other' && i.url);
 
-  // Build map of cacheKey → { gamePrefix, gid, items[] }
-  const groupFetchMap = {}; // cacheKey → { gamePrefix, gid, items: [{id, pid}] }
-
+  // Build fetch map keyed by cacheKey
+  const groupFetchMap = {};
   for (const item of sealedSingles) {
     const match = item.url.match(/\/product\/(\d+)/);
     if (!match) continue;
-    const gameName = (item.game || '').trim() || 'Pokemon';
-    const gamePrefix = TCGCSV_GAME_PREFIX[gameName] || 3;
+    const gameName   = (item.game || '').trim() || 'Pokemon';
+    const gamePrefix = String(TCGCSV_GAME_PREFIX[gameName] || 3);
     const gid = getGroupId(item.set);
     if (!gid) continue;
     const cacheKey = `${gamePrefix}_${gid}`;
@@ -1476,20 +1498,21 @@ async function batchFetchMarketPrices() {
     groupFetchMap[cacheKey].items.push({ id: item.id, pid: String(parseInt(match[1])) });
   }
 
-  // Fetch price data for each unique group (use cacheKey consistently)
+  // Fetch each unique group via Apps Script proxy
   for (const [cacheKey, entry] of Object.entries(groupFetchMap)) {
     if (!priceCache[cacheKey]) {
       try {
-        const res = await fetch(`https://tcgcsv.com/tcgplayer/${entry.gamePrefix}/${entry.gid}/prices`);
+        const url = `${scriptUrl}?action=getMarketPrice&gamePrefix=${entry.gamePrefix}&groupId=${entry.gid}`;
+        const res = await fetch(url, { redirect: 'follow' });
         if (res.ok) {
           const data = await res.json();
-          priceCache[cacheKey] = data.results || [];
+          if (!data.error) priceCache[cacheKey] = data.results || [];
         }
       } catch(e) {}
     }
   }
 
-  // Map prices back to items — compare productId as string to handle API type variations
+  // Map prices back to items
   for (const [cacheKey, entry] of Object.entries(groupFetchMap)) {
     const priceRows = priceCache[cacheKey] || [];
     for (const { id, pid } of entry.items) {
@@ -1816,69 +1839,91 @@ const TCGCSV_GAME_PREFIX = {
   'Pokemon': 3, 'Magic': 1, 'One Piece': 65, 'Yu-Gi-Oh': 2
 };
 
+// Fetch market price via Apps Script proxy (tcgcsv.com blocks direct browser requests)
 async function fetchMarketPrice(item) {
   const marketEl = document.getElementById('detailMarket');
   if (!item.url) { marketEl.innerHTML = `<span style="color:var(--t3)">N/A</span>`; return; }
   const match = item.url.match(/\/product\/(\d+)/);
-  if (!match) { marketEl.innerHTML = `<span style="color:var(--t3)">N/A</span>`; return; }
-  const productId = parseInt(match[1]);
-  // Resolve game prefix — handle undefined/empty game gracefully
-  const gameName = (item.game || '').trim() || 'Pokemon';
-  const gamePrefix = TCGCSV_GAME_PREFIX[gameName] || 3;
+  if (!match) { marketEl.innerHTML = `<span style="color:var(--t3)">N/A (no product ID)</span>`; return; }
+  const productId  = String(parseInt(match[1]));
+  const gameName   = (item.game || '').trim() || 'Pokemon';
+  const gamePrefix = String(TCGCSV_GAME_PREFIX[gameName] || 3);
+  const scriptUrl  = getSheetsUrl();
 
-  // Try to get groupId from set name first, then fall back to fetching groups
+  console.log('[Price] item:', item.name, '| set:', item.set, '| game:', gameName, '| prefix:', gamePrefix, '| productId:', productId, '| scriptUrl:', scriptUrl ? 'set' : 'MISSING');
+
+  if (!scriptUrl) {
+    marketEl.innerHTML = `<span style="color:var(--t3);font-size:11px">Set up Sheets sync to enable prices</span>`;
+    return;
+  }
+
+  marketEl.innerHTML = `<span class="market-loading">Loading…</span>`;
+
+  // Step 1: resolve groupId
   let groupId = getGroupId(item.set);
+  console.log('[Price] groupId from local map:', groupId, '(set:', item.set, ')');
 
-  // If no match in our map, fetch the groups list and try to find it
   if (!groupId) {
     try {
-      const groupsRes = await fetch(`https://tcgcsv.com/tcgplayer/${gamePrefix}/groups`);
-      if (groupsRes.ok) {
-        const groupsData = await groupsRes.json();
-        const setLower = (item.set || '').toLowerCase();
-        const found = (groupsData.results || []).find(g =>
-          g.name.toLowerCase().includes(setLower) || setLower.includes(g.name.toLowerCase())
-        );
-        if (found) groupId = found.groupId;
-      }
-    } catch(e) {}
+      const groupsUrl = `${scriptUrl}?action=getGroups&gamePrefix=${gamePrefix}`;
+      console.log('[Price] fetching groups:', groupsUrl);
+      const groupsRes = await fetch(groupsUrl, { redirect: 'follow' });
+      const groupsText = await groupsRes.text();
+      console.log('[Price] groups response status:', groupsRes.status, '| body snippet:', groupsText.slice(0,200));
+      const groupsData = JSON.parse(groupsText);
+      const setLower = (item.set || '').toLowerCase();
+      const found = (groupsData.results || []).find(g =>
+        g.name.toLowerCase().includes(setLower) || setLower.includes(g.name.toLowerCase())
+      );
+      console.log('[Price] groups lookup result:', found ? `found groupId ${found.groupId} (${found.name})` : 'NOT FOUND for set: ' + item.set);
+      if (found) groupId = found.groupId;
+    } catch(e) {
+      console.warn('[Price] groups fetch error:', e.message);
+    }
   }
 
   if (!groupId) {
+    console.warn('[Price] No groupId found for set:', item.set);
     marketEl.innerHTML = `<span style="color:var(--t3)">Set not found</span>`;
     return;
   }
 
-  // Key cache by game+group to prevent cross-game collisions
   const cacheKey = `${gamePrefix}_${groupId}`;
+  console.log('[Price] using cacheKey:', cacheKey, '| cached?', !!priceCache[cacheKey], '| cached rows:', priceCache[cacheKey]?.length || 0);
 
   try {
     if (!priceCache[cacheKey]) {
-      const res = await fetch(`https://tcgcsv.com/tcgplayer/${gamePrefix}/${groupId}/prices`);
-      if (!res.ok) throw new Error('fetch failed');
-      const data = await res.json();
+      const priceUrl = `${scriptUrl}?action=getMarketPrice&gamePrefix=${gamePrefix}&groupId=${groupId}`;
+      console.log('[Price] fetching prices:', priceUrl);
+      const res = await fetch(priceUrl, { redirect: 'follow' });
+      const text = await res.text();
+      console.log('[Price] price response status:', res.status, '| body snippet:', text.slice(0,300));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = JSON.parse(text);
+      if (data.error) throw new Error('Script error: ' + data.error);
       priceCache[cacheKey] = data.results || [];
+      console.log('[Price] cached', priceCache[cacheKey].length, 'price rows for', cacheKey);
     }
 
-    // Compare as string — tcgcsv API may return productId as string or number
-    const rows = priceCache[cacheKey].filter(r => String(r.productId) === String(productId));
+    const rows = priceCache[cacheKey].filter(r => String(r.productId) === productId);
+    console.log('[Price] rows matching productId', productId, ':', rows.length, '| sample IDs:', priceCache[cacheKey].slice(0,3).map(r=>r.productId));
     const best = rows.find(r => r.marketPrice && r.subTypeName === 'Normal')
               || rows.find(r => r.marketPrice && !r.subTypeName)
               || rows.find(r => r.marketPrice)
               || rows[0];
+    console.log('[Price] best row:', best ? JSON.stringify(best) : 'NONE');
 
     if (best?.marketPrice) {
       const label = (rows.length > 1 && best.subTypeName)
         ? ` <span style="font-size:10px;color:var(--t3)">(${best.subTypeName})</span>` : '';
       marketEl.innerHTML = `<span class="market-price-val">${fmtMoney(parseFloat(best.marketPrice))}</span>${label}`;
-      // Cache for inventory valuation
       marketPriceStore[item.id] = parseFloat(best.marketPrice);
       localStorage.setItem('ktcg_mktprices', JSON.stringify(marketPriceStore));
     } else {
       marketEl.innerHTML = `<span style="color:var(--t3)">No price data</span>`;
     }
   } catch(e) {
-    console.warn('fetchMarketPrice error:', e.message, 'item:', item.name, 'set:', item.set);
+    console.warn('[Price] fetch error:', e.message);
     marketEl.innerHTML = `<span style="color:var(--t3)">Unavailable</span>`;
   }
 }
