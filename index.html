@@ -145,6 +145,9 @@ body::before{display:none;}
 .search-wrap input:focus{border-color:var(--gold);}
 .search-wrap input::placeholder{color:var(--t3);}
 .search-ico{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--t3);font-size:15px;pointer-events:none;}
+.search-clear{position:absolute;right:10px;top:50%;transform:translateY(-50%);color:var(--t3);font-size:14px;cursor:pointer;padding:4px 6px;display:none;background:none;border:none;line-height:1;}
+.search-clear.visible{display:block;}
+.search-wrap input{padding-right:34px;}
 
 /* ── PRODUCT GRID ── */
 .prod-grid{
@@ -633,7 +636,8 @@ input[type=file]{padding:8px 12px;color:var(--t2);font-size:12px;}
   </div>
   <div class="search-wrap" style="margin-bottom:0">
     <span class="search-ico">⌕</span>
-    <input type="text" id="posSearch" placeholder="Search by name, set, short name…" oninput="renderPOS()">
+    <input type="text" id="posSearch" placeholder="Search by name, set, short name…" oninput="renderPOS();toggleClear('posSearch','posSearchClear')">
+    <button class="search-clear" id="posSearchClear" onclick="clearSearch('posSearch','posSearchClear',renderPOS)">✕</button>
   </div>
 </div>
 
@@ -655,7 +659,8 @@ input[type=file]{padding:8px 12px;color:var(--t2);font-size:12px;}
     <div class="sec-label" style="margin-top:0">Stock</div>
     <div class="search-wrap">
       <span class="search-ico">⌕</span>
-      <input type="text" id="invSearch" placeholder="Search inventory…" oninput="renderInventory()">
+      <input type="text" id="invSearch" placeholder="Search inventory…" oninput="renderInventory();toggleClear('invSearch','invSearchClear')">
+      <button class="search-clear" id="invSearchClear" onclick="clearSearch('invSearch','invSearchClear',renderInventory)">✕</button>
     </div>
     <div id="invList"></div>
   </div>
@@ -738,7 +743,12 @@ input[type=file]{padding:8px 12px;color:var(--t2);font-size:12px;}
     <!-- Prices -->
     <div class="setup-card">
       <div class="setup-card-title">💰 Set Sticker Prices</div>
-      <div class="setup-card-desc">Enter your sticker prices for the POS grid here.</div>
+      <div class="setup-card-desc">Enter your sticker prices for the POS grid here. Tap a name to see the full image.</div>
+      <div class="search-wrap" style="margin-bottom:8px">
+        <span class="search-ico">⌕</span>
+        <input type="text" id="priceSearch" placeholder="Search items…" oninput="renderPriceList();toggleClear('priceSearch','priceSearchClear')">
+        <button class="search-clear" id="priceSearchClear" onclick="clearSearch('priceSearch','priceSearchClear',renderPriceList)">✕</button>
+      </div>
       <div class="price-list" id="priceList"></div>
       <button class="btn btn-gold" style="margin-top:12px" onclick="savePrices()">Save Prices</button>
     </div>
@@ -1172,16 +1182,30 @@ function doPost(e) {
     const action  = payload.action;
     const rows    = payload.rows || [];
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sheetName;
-    if (action === 'appendSales')             sheetName = 'Sales Log';
-    else if (action === 'appendBuyTrade')     sheetName = 'Buy-Trade Log';
-    else if (action === 'appendInventorySnapshot') sheetName = 'Inventory Snapshot';
-    else throw new Error('Unknown action: ' + action);
+    // Tab name candidates per action — tries each in order until found
+    const tabCandidates = {
+      'appendSales':             ['Sales Log','Sales','SalesLog','sales log','sales'],
+      'appendBuyTrade':          ['Buy-Trade Log','Buy Trade Log','BuyTrade Log','Buy/Trade Log','Buy-Trade','buytrade log'],
+      'appendInventorySnapshot': ['Inventory Snapshot','Snapshot','inventory snapshot']
+    };
+    if (!tabCandidates[action]) throw new Error('Unknown action: ' + action);
 
-    let sheet = ss.getSheetByName(sheetName);
-    if (!sheet) throw new Error('Sheet "' + sheetName + '" not found in workbook');
+    let sheet = null;
+    for (const name of tabCandidates[action]) {
+      sheet = ss.getSheetByName(name);
+      if (sheet) break;
+    }
+    if (!sheet) throw new Error('Could not find sheet for action "' + action + '". Expected one of: ' + tabCandidates[action].join(', ') + '. Check your workbook tab names.');
 
-    // For snapshot: clear existing data rows first (keep header), then append
+    // For Sales Log: ensure columns L-O (Cash/Zelle/Venmo/CashApp) exist as headers
+    if (action === 'appendSales') {
+      const headerRow = sheet.getRange(3, 1, 1, 15).getValues()[0];
+      if (!headerRow[11] || headerRow[11] === '') {
+        sheet.getRange(3, 12, 1, 4).setValues([['Cash ($)','Zelle ($)','Venmo ($)','CashApp ($)']]);
+      }
+    }
+
+    // For snapshot: clear existing data rows first (keep headers), then append
     if (action === 'appendInventorySnapshot') {
       const lastRow = sheet.getLastRow();
       if (lastRow > 3) sheet.deleteRows(4, lastRow - 3);
@@ -1579,6 +1603,20 @@ function openLogModal() {
 // ══════════════════════════════════════════
 // POS
 // ══════════════════════════════════════════
+function toggleClear(inputId, btnId) {
+  const val = document.getElementById(inputId)?.value || '';
+  const btn = document.getElementById(btnId);
+  if (btn) btn.classList.toggle('visible', val.length > 0);
+}
+
+function clearSearch(inputId, btnId, renderFn) {
+  const inp = document.getElementById(inputId);
+  if (inp) inp.value = '';
+  const btn = document.getElementById(btnId);
+  if (btn) btn.classList.remove('visible');
+  if (renderFn) renderFn();
+}
+
 function setFilter() {
   posFilter     = document.getElementById('filterType')?.value || 'all';
   posGameFilter = document.getElementById('filterGame')?.value || 'all';
@@ -1778,7 +1816,9 @@ async function fetchMarketPrice(item) {
   const match = item.url.match(/\/product\/(\d+)/);
   if (!match) { marketEl.innerHTML = `<span style="color:var(--t3)">N/A</span>`; return; }
   const productId = parseInt(match[1]);
-  const gamePrefix = TCGCSV_GAME_PREFIX[item.game || 'Pokemon'] || 3;
+  // Resolve game prefix — handle undefined/empty game gracefully
+  const gameName = (item.game || '').trim() || 'Pokemon';
+  const gamePrefix = TCGCSV_GAME_PREFIX[gameName] || 3;
 
   // Try to get groupId from set name first, then fall back to fetching groups
   let groupId = getGroupId(item.set);
@@ -1803,16 +1843,18 @@ async function fetchMarketPrice(item) {
     return;
   }
 
+  // Key cache by game+group to prevent cross-game collisions
+  const cacheKey = `${gamePrefix}_${groupId}`;
+
   try {
-    // Use cache if available
-    if (!priceCache[groupId]) {
+    if (!priceCache[cacheKey]) {
       const res = await fetch(`https://tcgcsv.com/tcgplayer/${gamePrefix}/${groupId}/prices`);
       if (!res.ok) throw new Error('fetch failed');
       const data = await res.json();
-      priceCache[groupId] = data.results || [];
+      priceCache[cacheKey] = data.results || [];
     }
 
-    const rows = priceCache[groupId].filter(r => r.productId === productId);
+    const rows = priceCache[cacheKey].filter(r => r.productId === productId);
     const best = rows.find(r => r.marketPrice && r.subTypeName === 'Normal')
               || rows.find(r => r.marketPrice && !r.subTypeName)
               || rows.find(r => r.marketPrice)
@@ -2400,7 +2442,14 @@ function renderSetup() {
 function renderPriceList() {
   const el = document.getElementById('priceList');
   if (!el || inventory.length === 0) { if(el) el.innerHTML = `<div style="font-size:12px;color:var(--t3)">Import inventory first.</div>`; return; }
-  const sortedInv = applySortOrder(inventory);
+  const q = (document.getElementById('priceSearch')?.value || '').toLowerCase();
+  let sortedInv = applySortOrder(inventory);
+  if (q) sortedInv = sortedInv.filter(i =>
+    (i.short||i.name).toLowerCase().includes(q) ||
+    (i.name||'').toLowerCase().includes(q) ||
+    (i.set||'').toLowerCase().includes(q) ||
+    (i.type||'').toLowerCase().includes(q)
+  );
   el.innerHTML = sortedInv.map(item => `
     <div class="price-row">
       <div class="pos-toggle">
@@ -2986,23 +3035,33 @@ async function syncSalesToSheets(silent=false) {
   if (!sales.length) { if(!silent) showSheetsMsg('logSheetsMsg', '⚠ No sales to sync', true); return; }
   if(!silent) showSheetsMsg('logSheetsMsg', 'Syncing sales…', false);
   try {
-    // Build rows matching Sales Log sheet columns
+    // Build rows matching Sales Log sheet columns A-O
+    // Cols A-K: transaction data. Cols L-O: Cash, Zelle, Venmo, CashApp amounts
     const rows = [];
     sales.forEach(s => {
       const dt = new Date(s.timestamp);
       const date = dt.toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'numeric'});
       const time = dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
       const pay  = s.payments.map(p=>`${p.method}: $${Math.round(p.amount)}`).join(' + ');
+      const payAmt = (method) => {
+        const p = s.payments.find(p => p.method.toLowerCase() === method.toLowerCase());
+        return p ? Math.round(p.amount) : '';
+      };
       s.items.forEach((item, idx) => {
+        const isLast = idx === s.items.length - 1;
         rows.push([
           s.id, date, time,
           item.name, item.qty,
           Math.round(item.unitPrice),
           item.discountAmt > 0 ? Math.round(item.discountAmt) : '',
           Math.round(item.lineTotal),
-          idx === s.items.length - 1 && s.cartDiscount > 0 ? Math.round(s.cartDiscount) : '',
-          idx === s.items.length - 1 ? Math.round(s.total) : '',
-          idx === 0 ? pay : ''
+          isLast && s.cartDiscount > 0 ? Math.round(s.cartDiscount) : '',
+          isLast ? Math.round(s.total) : '',
+          idx === 0 ? pay : '',
+          isLast ? payAmt('Cash')    : '',
+          isLast ? payAmt('Zelle')   : '',
+          isLast ? payAmt('Venmo')   : '',
+          isLast ? payAmt('CashApp') : '',
         ]);
       });
     });
